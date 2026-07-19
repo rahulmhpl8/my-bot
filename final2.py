@@ -8,7 +8,7 @@ import threading
 import time
 import requests
 import os
-import shutil                     # file operations के लिए
+import shutil
 from datetime import datetime
 
 from telegram import (
@@ -48,7 +48,7 @@ CHANNEL_LINK = os.environ.get("CHANNEL_LINK", "https://t.me/lootjunctiontg")
 CHANNEL_USERNAME = os.environ.get("CHANNEL_USERNAME", "@lootjunctiontg")
 
 # ------------------ VERSION & AUTO-UPDATE ------------------
-CURRENT_VERSION = "1.0.2"
+CURRENT_VERSION = "1.0.3"
 UPDATE_MESSAGE = (
     "🚀 *New Update Available!*\n\n"
     "We've added new features and improvements. Check out the latest version now!\n"
@@ -1276,18 +1276,15 @@ async def set_referral_credits(update: Update, context: ContextTypes.DEFAULT_TYP
 async def get_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     
-    # Only admins can download the database
     if user_id not in ADMIN_USER_IDS:
         await update.message.reply_text("❌ You are not authorized to use this command.")
         return
     
     try:
-        # Check if database file exists
         if not os.path.exists(DB_NAME):
             await update.message.reply_text("❌ Database file not found!")
             return
         
-        # Send the database file
         with open(DB_NAME, 'rb') as f:
             await update.message.reply_document(
                 document=f,
@@ -1303,12 +1300,10 @@ async def get_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def upload_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     
-    # Only admins can upload the database
     if user_id not in ADMIN_USER_IDS:
         await update.message.reply_text("❌ You are not authorized to use this command.")
         return
     
-    # Check if a file is attached
     if not update.message.document:
         await update.message.reply_text(
             "❌ Please send a file.\n"
@@ -1316,7 +1311,6 @@ async def upload_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    # Check if it's a .db file
     file_name = update.message.document.file_name
     if not file_name.endswith('.db'):
         await update.message.reply_text(
@@ -1325,12 +1319,11 @@ async def upload_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     try:
-        # Download the file
         file = await update.message.document.get_file()
         temp_path = f"/tmp/{file_name}"
         await file.download_to_drive(temp_path)
         
-        # Check if file is valid SQLite database
+        # Validate SQLite database
         try:
             conn = sqlite3.connect(temp_path)
             conn.execute("SELECT 1 FROM users LIMIT 1")
@@ -1348,13 +1341,13 @@ async def upload_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
             shutil.copy2(DB_NAME, backup_name)
             await update.message.reply_text(f"✅ Old database backed up as: {backup_name}")
         
-        # Replace with new database
         shutil.move(temp_path, DB_NAME)
         
         await update.message.reply_text(
             f"✅ Database updated successfully!\n"
             f"📁 New database: {file_name}\n"
-            f"📅 Updated at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            f"📅 Updated at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+            f"⚠️ Please restart the bot for changes to take effect."
         )
         print(f"✅ Database uploaded by admin {user_id}")
         
@@ -1493,7 +1486,15 @@ def main():
     print("Script is created by Rahul Mahipal")
     
     init_db()
-    app = Application.builder().token(BOT_TOKEN).build()
+    
+    # ✅ FIX: Timeouts set to prevent ReadTimeout errors
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .connect_timeout(20.0)   # Connection timeout
+        .read_timeout(20.0)      # Read timeout
+        .build()
+    )
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("leaderboard", leaderboard))
