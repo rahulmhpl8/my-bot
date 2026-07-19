@@ -7,7 +7,8 @@ import asyncio
 import threading
 import time
 import requests
-import os                     # Environment variables के लिए
+import os
+import shutil                     # file operations के लिए
 from datetime import datetime
 
 from telegram import (
@@ -39,7 +40,6 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN environment variable is not set!")
 
-# ADMIN_USER_IDS – कॉमा से अलग करके लिखें, जैसे "543578081,987654321"
 admin_ids_str = os.environ.get("ADMIN_USER_IDS", "543578081")
 ADMIN_USER_IDS = [int(x.strip()) for x in admin_ids_str.split(',') if x.strip().isdigit()]
 
@@ -55,8 +55,8 @@ UPDATE_MESSAGE = (
     "Use the buttons below to explore."
 )
 
-# ------------------ DATABASE (पथ अब Environment Variable से) ------------------
-DB_NAME = os.environ.get("DB_PATH", "users.db")   # Railway पर /data/users.db दें
+# ------------------ DATABASE ------------------
+DB_NAME = os.environ.get("DB_PATH", "users.db")
 
 # ------------------ URL SHORTENER ------------------
 def shorten_url(url):
@@ -1272,6 +1272,96 @@ async def set_referral_credits(update: Update, context: ContextTypes.DEFAULT_TYP
     set_credits_per_referral(amount)
     await update.message.reply_text(f"✅ Referral credits per referral set to **{amount}**.")
 
+# ------------------ GET DATABASE COMMAND (ADMIN ONLY) ------------------
+async def get_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    
+    # Only admins can download the database
+    if user_id not in ADMIN_USER_IDS:
+        await update.message.reply_text("❌ You are not authorized to use this command.")
+        return
+    
+    try:
+        # Check if database file exists
+        if not os.path.exists(DB_NAME):
+            await update.message.reply_text("❌ Database file not found!")
+            return
+        
+        # Send the database file
+        with open(DB_NAME, 'rb') as f:
+            await update.message.reply_document(
+                document=f,
+                filename="users.db",
+                caption=f"📊 Database backup\n📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n📁 Size: {os.path.getsize(DB_NAME)} bytes"
+            )
+        print(f"✅ Database sent to admin {user_id}")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error sending database: {str(e)[:100]}")
+        logging.error(f"get_db error: {e}")
+
+# ------------------ UPLOAD DATABASE COMMAND (ADMIN ONLY) ------------------
+async def upload_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    
+    # Only admins can upload the database
+    if user_id not in ADMIN_USER_IDS:
+        await update.message.reply_text("❌ You are not authorized to use this command.")
+        return
+    
+    # Check if a file is attached
+    if not update.message.document:
+        await update.message.reply_text(
+            "❌ Please send a file.\n"
+            "Usage: Send a .db file with caption /uploaddb"
+        )
+        return
+    
+    # Check if it's a .db file
+    file_name = update.message.document.file_name
+    if not file_name.endswith('.db'):
+        await update.message.reply_text(
+            "❌ Please send a valid .db file."
+        )
+        return
+    
+    try:
+        # Download the file
+        file = await update.message.document.get_file()
+        temp_path = f"/tmp/{file_name}"
+        await file.download_to_drive(temp_path)
+        
+        # Check if file is valid SQLite database
+        try:
+            conn = sqlite3.connect(temp_path)
+            conn.execute("SELECT 1 FROM users LIMIT 1")
+            conn.close()
+        except Exception as e:
+            await update.message.reply_text(
+                f"❌ Invalid database file: {str(e)[:100]}"
+            )
+            os.remove(temp_path)
+            return
+        
+        # Backup old database
+        if os.path.exists(DB_NAME):
+            backup_name = f"{DB_NAME}.backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            shutil.copy2(DB_NAME, backup_name)
+            await update.message.reply_text(f"✅ Old database backed up as: {backup_name}")
+        
+        # Replace with new database
+        shutil.move(temp_path, DB_NAME)
+        
+        await update.message.reply_text(
+            f"✅ Database updated successfully!\n"
+            f"📁 New database: {file_name}\n"
+            f"📅 Updated at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+        print(f"✅ Database uploaded by admin {user_id}")
+        
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error uploading database: {str(e)[:100]}")
+        logging.error(f"upload_db error: {e}")
+
 # ------------------ BROADCAST COMMAND ------------------
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -1386,6 +1476,8 @@ async def setup_commands(app):
         BotCommand("reply", "💬 Reply to a user's support message"),
         BotCommand("broadcast", "📢 Send a message to all users"),
         BotCommand("set_referral_credits", "⚙️ Change referral bonus amount"),
+        BotCommand("getdb", "📥 Download database file"),
+        BotCommand("uploaddb", "📤 Upload database file (send .db file)"),
     ]
     await app.bot.set_my_commands(default_commands, scope=BotCommandScopeDefault())
     for admin_id in ADMIN_USER_IDS:
@@ -1414,6 +1506,8 @@ def main():
     app.add_handler(CommandHandler("reply", reply_user))
     app.add_handler(CommandHandler("broadcast", broadcast))
     app.add_handler(CommandHandler("set_referral_credits", set_referral_credits))
+    app.add_handler(CommandHandler("getdb", get_db))
+    app.add_handler(CommandHandler("uploaddb", upload_db))
 
     app.add_handler(CallbackQueryHandler(check_join_callback, pattern="^check_join$"))
     app.add_handler(CallbackQueryHandler(refer_back_callback, pattern="^refer_back$"))
