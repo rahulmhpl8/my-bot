@@ -9,7 +9,9 @@ import time
 import requests
 import os
 import shutil
-from datetime import datetime
+from datetime import datetime, timedelta
+from collections import defaultdict
+from functools import wraps
 
 from telegram import (
     Update,
@@ -48,12 +50,207 @@ CHANNEL_LINK = os.environ.get("CHANNEL_LINK", "https://t.me/lootjunctiontg")
 CHANNEL_USERNAME = os.environ.get("CHANNEL_USERNAME", "@lootjunctiontg")
 
 # ------------------ VERSION & AUTO-UPDATE ------------------
-CURRENT_VERSION = "1.0.3"
+CURRENT_VERSION = "1.0.6"
 UPDATE_MESSAGE = (
     "🚀 *New Update Available!*\n\n"
-    "We've added new features and improvements. Check out the latest version now!\n"
-    "Use the buttons below to explore."
+    "✨ New Features:\n"
+    "• 🎰 FREE Spin Wheel - Win up to 10 credits!\n"
+    "• 🛡️ Rate Limiting for security\n"
+    "• ⏰ Hourly spin limit (configurable)\n"
+    "• 📊 User Activity Logs\n"
+    "• 👤 View user activity\n\n"
+    "Update now to enjoy new features!"
 )
+
+# ------------------ RATE LIMITING ------------------
+# Store user request timestamps
+user_requests = defaultdict(list)
+# Max requests per minute
+MAX_REQUESTS_PER_MINUTE = 5
+# Cooldown in seconds after limit reached
+COOLDOWN_SECONDS = 60
+
+def check_rate_limit(user_id):
+    """Check if user has exceeded rate limit"""
+    now = time.time()
+    # Get user's request timestamps
+    timestamps = user_requests[user_id]
+    # Remove timestamps older than 60 seconds
+    timestamps = [ts for ts in timestamps if now - ts < 60]
+    user_requests[user_id] = timestamps
+    
+    if len(timestamps) >= MAX_REQUESTS_PER_MINUTE:
+        return False, COOLDOWN_SECONDS - (now - timestamps[0]) if timestamps else 0
+    
+    # Add current request
+    user_requests[user_id].append(now)
+    return True, 0
+
+def rate_limit_decorator(func):
+    """Decorator to apply rate limiting to handlers"""
+    @wraps(func)
+    async def wrapper(update, context, *args, **kwargs):
+        user_id = update.effective_user.id
+        
+        # Skip rate limiting for admins
+        if user_id in ADMIN_USER_IDS:
+            return await func(update, context, *args, **kwargs)
+        
+        allowed, wait_time = check_rate_limit(user_id)
+        if not allowed:
+            await update.message.reply_text(
+                f"⚠️ *Too many requests!*\n\n"
+                f"Please wait {int(wait_time)} seconds before trying again.\n\n"
+                f"🛡️ *Rate Limit:* {MAX_REQUESTS_PER_MINUTE} requests per minute",
+                parse_mode="Markdown"
+            )
+            return
+        
+        return await func(update, context, *args, **kwargs)
+    return wrapper
+
+# ------------------ USER ACTIVITY LOGS ------------------
+def log_user_activity(user_id, action, details=""):
+    """Log user activity to database"""
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute(
+        "INSERT INTO user_activity (user_id, action, details, timestamp) VALUES (?, ?, ?, ?)",
+        (user_id, action, details, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    )
+    conn.commit()
+    conn.close()
+
+def get_user_activity(user_id, limit=50):
+    """Get user's recent activity"""
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute(
+        "SELECT action, details, timestamp FROM user_activity WHERE user_id = ? ORDER BY timestamp DESC LIMIT ?",
+        (user_id, limit)
+    )
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def get_all_activity(limit=100):
+    """Get all user activity (admin only)"""
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute(
+        "SELECT user_id, action, details, timestamp FROM user_activity ORDER BY timestamp DESC LIMIT ?",
+        (limit,)
+    )
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def get_activity_stats():
+    """Get activity statistics"""
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    
+    # Total activities
+    c.execute("SELECT COUNT(*) FROM user_activity")
+    total = c.fetchone()[0] or 0
+    
+    # Activities today
+    today = datetime.now().strftime("%Y-%m-%d")
+    c.execute("SELECT COUNT(*) FROM user_activity WHERE date(timestamp) = ?", (today,))
+    today_count = c.fetchone()[0] or 0
+    
+    # Most active users
+    c.execute("""
+        SELECT user_id, COUNT(*) as count 
+        FROM user_activity 
+        WHERE date(timestamp) = ?
+        GROUP BY user_id 
+        ORDER BY count DESC 
+        LIMIT 10
+    """, (today,))
+    active_users = c.fetchall()
+    
+    # Action breakdown
+    c.execute("""
+        SELECT action, COUNT(*) as count 
+        FROM user_activity 
+        WHERE date(timestamp) = ?
+        GROUP BY action 
+        ORDER BY count DESC
+    """, (today,))
+    action_stats = c.fetchall()
+    
+    conn.close()
+    return total, today_count, active_users, action_stats
+
+# ------------------ SPIN WHEEL FUNCTIONS ------------------
+# Store user's last spin time
+user_last_spin = {}
+
+def get_spin_limit():
+    """Get spin limit in hours (default: 1 hour)"""
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("SELECT value FROM config WHERE key = 'spin_limit_hours'")
+    row = c.fetchone()
+    conn.close()
+    return int(row[0]) if row else 1
+
+def set_spin_limit(hours):
+    """Set spin limit in hours"""
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("UPDATE config SET value = ? WHERE key = 'spin_limit_hours'", (str(hours),))
+    conn.commit()
+    conn.close()
+
+def can_spin(user_id):
+    """Check if user can spin (based on hourly limit)"""
+    spin_limit_hours = get_spin_limit()
+    
+    # Admins can spin anytime
+    if user_id in ADMIN_USER_IDS:
+        return True, 0
+    
+    last_spin = user_last_spin.get(user_id)
+    if not last_spin:
+        return True, 0
+    
+    # Check if spin limit has passed
+    time_passed = time.time() - last_spin
+    limit_seconds = spin_limit_hours * 3600
+    
+    if time_passed >= limit_seconds:
+        return True, 0
+    
+    remaining = limit_seconds - time_passed
+    return False, remaining
+
+def get_spin_prizes():
+    """Get spin prizes list"""
+    return [0, 1, 1, 2, 2, 3, 3, 5, 5, 10]
+
+def spin_wheel():
+    """Spin the wheel and return prize amount"""
+    prizes = get_spin_prizes()
+    return random.choice(prizes)
+
+def save_spin_history(user_id, prize):
+    """Save spin history"""
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("INSERT INTO spin_history (user_id, prize) VALUES (?, ?)", (user_id, prize))
+    conn.commit()
+    conn.close()
+
+def get_spin_stats(user_id):
+    """Get user's spin statistics"""
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*), SUM(prize) FROM spin_history WHERE user_id = ?", (user_id,))
+    row = c.fetchone()
+    conn.close()
+    return row[0] or 0, row[1] or 0
 
 # ------------------ DATABASE ------------------
 DB_NAME = os.environ.get("DB_PATH", "users.db")
@@ -92,7 +289,9 @@ def init_db():
             join_date TEXT,
             refer_count INTEGER DEFAULT 0,
             verified INTEGER DEFAULT 0,
-            full_name TEXT
+            full_name TEXT,
+            daily_login_date TEXT,
+            daily_login_streak INTEGER DEFAULT 0
         )
     """)
     c.execute("PRAGMA table_info(users)")
@@ -101,6 +300,10 @@ def init_db():
         c.execute("ALTER TABLE users ADD COLUMN verified INTEGER DEFAULT 0")
     if 'full_name' not in columns:
         c.execute("ALTER TABLE users ADD COLUMN full_name TEXT")
+    if 'daily_login_date' not in columns:
+        c.execute("ALTER TABLE users ADD COLUMN daily_login_date TEXT")
+    if 'daily_login_streak' not in columns:
+        c.execute("ALTER TABLE users ADD COLUMN daily_login_streak INTEGER DEFAULT 0")
     c.execute("CREATE INDEX IF NOT EXISTS idx_ref_code ON users(ref_code)")
 
     c.execute("""
@@ -111,6 +314,7 @@ def init_db():
     """)
     c.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('credits_per_referral', '2')")
     c.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('bot_version', ?)", (CURRENT_VERSION,))
+    c.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('spin_limit_hours', '1')")
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS gemini_history (
@@ -118,10 +322,40 @@ def init_db():
             user_id INTEGER,
             link TEXT,
             short_link TEXT,
+            mobile_number TEXT,
             extracted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    c.execute("PRAGMA table_info(gemini_history)")
+    history_columns = [col[1] for col in c.fetchall()]
+    if 'mobile_number' not in history_columns:
+        c.execute("ALTER TABLE gemini_history ADD COLUMN mobile_number TEXT")
+    
     c.execute("CREATE INDEX IF NOT EXISTS idx_history_user ON gemini_history(user_id)")
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS spin_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            prize INTEGER,
+            spun_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    c.execute("CREATE INDEX IF NOT EXISTS idx_spin_user ON spin_history(user_id)")
+
+    # User Activity Logs Table
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS user_activity (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            action TEXT,
+            details TEXT,
+            timestamp TEXT
+        )
+    """)
+    c.execute("CREATE INDEX IF NOT EXISTS idx_activity_user ON user_activity(user_id)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_activity_time ON user_activity(timestamp)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_activity_action ON user_activity(action)")
 
     conn.commit()
     conn.close()
@@ -148,6 +382,8 @@ def add_user(user_id, referred_by=None, full_name=None):
     )
     conn.commit()
     conn.close()
+    
+    log_user_activity(user_id, "REGISTER", "New user registered")
 
 def get_user(user_id):
     conn = sqlite3.connect(DB_NAME)
@@ -224,6 +460,41 @@ def add_all_credits(amount):
     conn.commit()
     conn.close()
 
+# ---------- DAILY LOGIN BONUS ----------
+def check_daily_login(user_id):
+    """Check and give daily login bonus if eligible"""
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("SELECT daily_login_date, daily_login_streak FROM users WHERE user_id = ?", (user_id,))
+    row = c.fetchone()
+    
+    if not row:
+        conn.close()
+        return None, None
+    
+    last_login = row[0]
+    streak = row[1] or 0
+    today = datetime.now().date()
+    
+    if last_login:
+        last_date = datetime.strptime(last_login, "%Y-%m-%d").date()
+        if last_date == today:
+            conn.close()
+            return False, streak
+        elif last_date == today - timedelta(days=1):
+            streak += 1
+        else:
+            streak = 1
+    
+    bonus = 1 + min(streak, 5)
+    
+    c.execute("UPDATE users SET credits = credits + ?, daily_login_date = ?, daily_login_streak = ? WHERE user_id = ?", 
+              (bonus, today.strftime("%Y-%m-%d"), streak, user_id))
+    conn.commit()
+    conn.close()
+    
+    return True, streak, bonus
+
 # ---------- CONFIG FUNCTIONS ----------
 def get_credits_per_referral():
     conn = sqlite3.connect(DB_NAME)
@@ -256,12 +527,12 @@ def set_bot_version(version):
     conn.close()
 
 # ---------- GEMINI HISTORY FUNCTIONS ----------
-def save_gemini_link(user_id, original_link, short_link):
+def save_gemini_link(user_id, original_link, short_link, mobile_number):
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
     c.execute(
-        "INSERT INTO gemini_history (user_id, link, short_link) VALUES (?, ?, ?)",
-        (user_id, original_link, short_link)
+        "INSERT INTO gemini_history (user_id, link, short_link, mobile_number) VALUES (?, ?, ?, ?)",
+        (user_id, original_link, short_link, mobile_number)
     )
     conn.commit()
     conn.close()
@@ -270,7 +541,7 @@ def get_user_gemini_history(user_id, limit=10):
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
     c.execute(
-        "SELECT short_link, extracted_at FROM gemini_history WHERE user_id = ? ORDER BY extracted_at DESC LIMIT ?",
+        "SELECT short_link, extracted_at, mobile_number FROM gemini_history WHERE user_id = ? ORDER BY extracted_at DESC LIMIT ?",
         (user_id, limit)
     )
     rows = c.fetchall()
@@ -282,7 +553,8 @@ main_reply_keyboard = ReplyKeyboardMarkup(
     [
         ["🔵 Gemini", "🔴 Profile"],
         ["🟢 Refer", "🟡 Support"],
-        ["📜 History", "🏆 Leaderboard"]
+        ["📜 History", "🏆 Leaderboard"],
+        ["🎰 Spin Wheel"]
     ],
     resize_keyboard=True,
     one_time_keyboard=False
@@ -363,6 +635,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user:
         add_user(user_id, referred_by=None, full_name=full_name)
         user = get_user(user_id)
+        log_user_activity(user_id, "START", "New user started bot")
     else:
         if not user[7] and full_name:
             conn = sqlite3.connect(DB_NAME)
@@ -371,6 +644,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             conn.commit()
             conn.close()
             user = get_user(user_id)
+        log_user_activity(user_id, "START", "Existing user started bot")
+
+    if user:
+        login_result = check_daily_login(user_id)
+        if login_result[0]:
+            _, streak, bonus = login_result
+            log_user_activity(user_id, "DAILY_LOGIN", f"Streak: {streak}, Bonus: {bonus} credits")
+            await update.message.reply_text(
+                f"🎉 *Daily Login Bonus!*\n\n"
+                f"You received **{bonus}** credits for logging in today!\n"
+                f"🔥 Streak: {streak} days\n\n"
+                f"Total credits: {user[2] + bonus}",
+                parse_mode="Markdown"
+            )
 
     if user and user[6] == 1:
         try:
@@ -394,6 +681,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         referrer_id = get_user_by_ref(ref_code)
         if referrer_id and referrer_id != user_id:
             context.user_data['pending_referrer'] = referrer_id
+            log_user_activity(user_id, "REFERRAL_CLICK", f"Referrer: {referrer_id}")
 
     display_name = full_name or "User"
     await update.message.reply_text(
@@ -423,8 +711,12 @@ async def check_join_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
                 c.execute("UPDATE users SET refer_count = refer_count + 1 WHERE user_id = ?", (referrer_id,))
                 c.execute("UPDATE users SET referred_by = ? WHERE user_id = ? AND referred_by IS NULL", (referrer_id, user_id))
                 context.user_data.pop('pending_referrer', None)
+                log_user_activity(user_id, "REFERRAL_SUCCESS", f"Referred by: {referrer_id}")
+                log_user_activity(referrer_id, "REFERRAL_EARNED", f"Referred user: {user_id}")
             conn.commit()
             conn.close()
+
+            log_user_activity(user_id, "VERIFIED", "User verified channel membership")
 
             await query.edit_message_text(
                 text=f"✅ Verified! Welcome to the bot.\nYour unique ID: {user_id}",
@@ -477,6 +769,7 @@ async def require_verified(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return True
 
 # ---------- Profile ----------
+@rate_limit_decorator
 async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     message = update.message
@@ -489,6 +782,8 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user[6] == 0:
         await send_join_prompt(update, context)
         return
+
+    log_user_activity(user_id, "VIEW_PROFILE", "")
 
     try:
         join_dt = datetime.strptime(user[4], "%Y-%m-%d %H:%M:%S")
@@ -508,6 +803,7 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await message.reply_text(text, parse_mode="Markdown", reply_markup=main_reply_keyboard)
 
 # ---------- Refer ----------
+@rate_limit_decorator
 async def refer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     message = update.message
@@ -521,9 +817,12 @@ async def refer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_join_prompt(update, context)
         return
 
+    log_user_activity(user_id, "VIEW_REFERRAL", f"Ref Code: {user[1]}")
+
     bonus = get_credits_per_referral()
     ref_link = f"https://t.me/{BOT_USERNAME}?start=ref{user[1]}"
     share_url = f"https://t.me/share/url?url={ref_link}&text=Join%20this%20bot%20and%20get%20credits!"
+    
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("📤 Share", url=share_url)],
         [InlineKeyboardButton("🔙 Main Menu", callback_data="refer_back")]
@@ -545,9 +844,14 @@ async def refer_back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
 
 # ---------- Leaderboard ----------
+@rate_limit_decorator
 async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
     if not await require_verified(update, context):
         return
+    
+    log_user_activity(user_id, "VIEW_LEADERBOARD", "")
+    
     rows = get_all_users()
     if not rows:
         await update.message.reply_text("No users yet.", reply_markup=main_reply_keyboard)
@@ -560,12 +864,15 @@ async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_reply_keyboard)
 
 # ---------- History ----------
+@rate_limit_decorator
 async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     message = update.message
 
     if not await require_verified(update, context):
         return
+
+    log_user_activity(user_id, "VIEW_HISTORY", "")
 
     rows = get_user_gemini_history(user_id, limit=10)
     if not rows:
@@ -578,13 +885,13 @@ async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     text = "📜 *Your Gemini Link History (last 10)*\n\n"
-    for short_link, extracted_at in rows:
+    for short_link, extracted_at, mobile_number in rows:
         try:
             dt = datetime.strptime(extracted_at, "%Y-%m-%d %H:%M:%S")
             date_str = dt.strftime("%d-%m-%Y %H:%M")
         except:
             date_str = extracted_at[:16]
-        text += f"• `{short_link}`  _(extracted: {date_str})_\n"
+        text += f"• 📱 `{mobile_number}` — `{short_link}`  _(extracted: {date_str})_\n"
 
     await message.reply_text(
         text,
@@ -592,99 +899,101 @@ async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=main_reply_keyboard
     )
 
-# ------------------ GEMINI FLOW ------------------
-async def gemini_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ---------- SPIN WHEEL ----------
+@rate_limit_decorator
+async def spin_wheel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    chat_id = update.effective_chat.id
     message = update.message
 
-    old_timer = context.user_data.pop('gemini_timer_msg_id', None)
-    if old_timer:
-        try:
-            await context.bot.delete_message(chat_id=chat_id, message_id=old_timer)
-        except Exception:
-            pass
+    if not await require_verified(update, context):
+        return
 
     user = get_user(user_id)
     if not user:
         await message.reply_text("Please /start the bot first.")
         return
 
-    if user[6] == 0:
-        await send_join_prompt(update, context)
-        return
-
-    if user[2] <= 0:
+    can_spin_now, remaining = can_spin(user_id)
+    
+    if not can_spin_now:
+        remaining_minutes = int(remaining / 60)
+        remaining_seconds = int(remaining % 60)
+        spin_limit = get_spin_limit()
+        
+        text = (
+            f"⏳ *Please wait before spinning again!*\n\n"
+            f"You can spin again in **{remaining_minutes}m {remaining_seconds}s**\n"
+            f"⏰ Spin limit: Every {spin_limit} hour(s)\n\n"
+            f"💡 *Tip:* Spin is absolutely FREE!"
+        )
         await message.reply_text(
-            "⚠️ *Insufficient Credits!*\n\n"
-            "Please Refer This Bot to Earn Credit or Contact Our Support.\n\n"
-            "Use the *Refer* button to share your referral link and earn credits per new user.",
+            text,
             parse_mode="Markdown",
             reply_markup=main_reply_keyboard
         )
         return
 
-    await replace_bot_message(
-        chat_id=chat_id,
-        context=context,
-        text="*Gemini Link Extractor*\n\nPlease Enter 10 Digit Number:",
+    prize = spin_wheel()
+    
+    if prize > 0:
+        add_credits(user_id, prize)
+        new_balance = user[2] + prize
+        text = f"🎰 *Spin Result!*\n\nYou won: **{prize}** credits! 🎉\n\nNew balance: {new_balance} credits"
+    else:
+        new_balance = user[2]
+        text = f"😅 *Try Again!*\n\nNo luck this time. Spin again for a chance to win!\n\nCurrent balance: {new_balance} credits"
+    
+    log_user_activity(user_id, "SPIN_WHEEL", f"Prize: {prize} credits, Balance: {new_balance}")
+    save_spin_history(user_id, prize)
+    user_last_spin[user_id] = time.time()
+    
+    total_spins, total_won = get_spin_stats(user_id)
+    spin_limit = get_spin_limit()
+    
+    text += f"\n\n📊 *Spin Stats*\nTotal Spins: {total_spins}\nTotal Won: {total_won} credits\n⏰ Limit: Every {spin_limit} hour(s)"
+    
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎰 Spin Again", callback_data="spin_again")],
+        [InlineKeyboardButton("🔙 Main Menu", callback_data="spin_back")]
+    ])
+    
+    await message.reply_text(
+        text,
         parse_mode="Markdown",
-        reply_markup=main_reply_keyboard,
-        key='gemini_last_msg_id'
+        reply_markup=keyboard
     )
-    context.user_data['gemini_step'] = 'awaiting_mobile'
-    context.user_data['jio_otp'] = None
-    context.user_data['otp_attempts'] = 0
-    context.user_data.pop('gemini_cancelled', None)
 
-async def gemini_mobile_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_text = update.message.text.strip()
-    step = context.user_data.get('gemini_step')
-    chat_id = update.effective_chat.id
-
-    if step == 'awaiting_mobile':
-        if not user_text.isdigit() or len(user_text) != 10:
-            await update.message.reply_text(
-                "❌ *Invalid number!*\nPlease enter a 10-digit number or press a main menu button to cancel.",
-                parse_mode="Markdown",
-                reply_markup=main_reply_keyboard
+async def spin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = update.effective_user.id
+    action = query.data
+    
+    if action == "spin_again":
+        can_spin_now, remaining = can_spin(user_id)
+        
+        if not can_spin_now:
+            remaining_minutes = int(remaining / 60)
+            remaining_seconds = int(remaining % 60)
+            spin_limit = get_spin_limit()
+            
+            await query.message.edit_text(
+                f"⏳ *Please wait before spinning again!*\n\n"
+                f"You can spin again in **{remaining_minutes}m {remaining_seconds}s**\n"
+                f"⏰ Spin limit: Every {spin_limit} hour(s)",
+                parse_mode="Markdown"
             )
             return
-
-        context.user_data['jio_mobile'] = user_text
-        context.user_data['gemini_step'] = 'awaiting_otp'
-
-        await replace_bot_message(
-            chat_id=chat_id,
-            context=context,
-            text="Processing... ⏳",
-            reply_markup=main_reply_keyboard,
-            key='gemini_last_msg_id'
-        )
-
-        loop = asyncio.get_running_loop()
-        threading.Thread(
-            target=perform_jio_login,
-            args=(update, context, user_text, loop, chat_id),
-            daemon=True
-        ).start()
-
-    elif step == 'awaiting_otp':
-        if not user_text.isdigit() or len(user_text) < 4:
-            await update.message.reply_text(
-                "❌ *Invalid OTP!*\nPlease enter the 4-6 digit OTP received on your mobile:",
-                parse_mode="Markdown",
-                reply_markup=main_reply_keyboard
-            )
-            return
-
-        context.user_data['jio_otp'] = user_text
-        await replace_bot_message(
-            chat_id=chat_id,
-            context=context,
-            text="⏳ Submitting OTP...",
-            reply_markup=main_reply_keyboard,
-            key='gemini_last_msg_id'
+        
+        await query.message.delete()
+        await spin_wheel_handler(update, context)
+    elif action == "spin_back":
+        await query.message.delete()
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="Returning to main menu.",
+            reply_markup=main_reply_keyboard
         )
 
 # ------------------ JIO LOGIN API ------------------
@@ -734,7 +1043,108 @@ def _extract_redirection_url(body):
         return redirect_by_key[0]
     return None
 
+# ------------------ GEMINI FLOW ------------------
+@rate_limit_decorator
+async def gemini_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    message = update.message
+
+    old_timer = context.user_data.pop('gemini_timer_msg_id', None)
+    if old_timer:
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=old_timer)
+        except Exception:
+            pass
+
+    user = get_user(user_id)
+    if not user:
+        await message.reply_text("Please /start the bot first.")
+        return
+
+    if user[6] == 0:
+        await send_join_prompt(update, context)
+        return
+
+    if user[2] <= 0:
+        await message.reply_text(
+            "⚠️ *Insufficient Credits!*\n\n"
+            "Please Refer This Bot to Earn Credit or Contact Our Support.\n\n"
+            "Use the *Refer* button to share your referral link and earn credits per new user.",
+            parse_mode="Markdown",
+            reply_markup=main_reply_keyboard
+        )
+        return
+
+    log_user_activity(user_id, "GEMINI_START", "Started Gemini extraction")
+
+    await replace_bot_message(
+        chat_id=chat_id,
+        context=context,
+        text="*Gemini Link Extractor*\n\nPlease Enter 10 Digit Number:",
+        parse_mode="Markdown",
+        reply_markup=main_reply_keyboard,
+        key='gemini_last_msg_id'
+    )
+    context.user_data['gemini_step'] = 'awaiting_mobile'
+    context.user_data['jio_otp'] = None
+    context.user_data['otp_attempts'] = 0
+    context.user_data.pop('gemini_cancelled', None)
+
+async def gemini_mobile_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_text = update.message.text.strip()
+    step = context.user_data.get('gemini_step')
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+
+    if step == 'awaiting_mobile':
+        if not user_text.isdigit() or len(user_text) != 10:
+            await update.message.reply_text(
+                "❌ *Invalid number!*\nPlease enter a 10-digit number or press a main menu button to cancel.",
+                parse_mode="Markdown",
+                reply_markup=main_reply_keyboard
+            )
+            return
+
+        context.user_data['jio_mobile'] = user_text
+        context.user_data['gemini_step'] = 'awaiting_otp'
+
+        await replace_bot_message(
+            chat_id=chat_id,
+            context=context,
+            text="Processing... ⏳",
+            reply_markup=main_reply_keyboard,
+            key='gemini_last_msg_id'
+        )
+
+        loop = asyncio.get_running_loop()
+        threading.Thread(
+            target=perform_jio_login,
+            args=(update, context, user_text, loop, chat_id),
+            daemon=True
+        ).start()
+
+    elif step == 'awaiting_otp':
+        if not user_text.isdigit() or len(user_text) < 4:
+            await update.message.reply_text(
+                "❌ *Invalid OTP!*\nPlease enter the 4-6 digit OTP received on your mobile:",
+                parse_mode="Markdown",
+                reply_markup=main_reply_keyboard
+            )
+            return
+
+        context.user_data['jio_otp'] = user_text
+        await replace_bot_message(
+            chat_id=chat_id,
+            context=context,
+            text="⏳ Submitting OTP...",
+            reply_markup=main_reply_keyboard,
+            key='gemini_last_msg_id'
+        )
+
 def perform_jio_login(update, context, mobile, loop, chat_id):
+    user_id = update.effective_user.id
+    
     def notify(text):
         asyncio.run_coroutine_threadsafe(
             replace_bot_message(
@@ -751,7 +1161,6 @@ def perform_jio_login(update, context, mobile, loop, chat_id):
     try:
         session = _build_jio_session()
 
-        # ---------- 1. Send OTP ----------
         asyncio.run_coroutine_threadsafe(
             replace_bot_message(
                 chat_id=chat_id,
@@ -785,7 +1194,6 @@ def perform_jio_login(update, context, mobile, loop, chat_id):
             )
             return
 
-        # OTP sent – start timer message
         async def send_timer_msg():
             msg = await context.bot.send_message(
                 chat_id=chat_id,
@@ -798,7 +1206,6 @@ def perform_jio_login(update, context, mobile, loop, chat_id):
         timer_msg_id = asyncio.run_coroutine_threadsafe(send_timer_msg(), loop).result()
         context.user_data['gemini_timer_msg_id'] = timer_msg_id
 
-        # ---------- 2. Wait for OTP with timer (max 30 seconds) ----------
         max_seconds = 30
         otp_received = None
         for remaining in range(max_seconds, 0, -1):
@@ -867,7 +1274,6 @@ def perform_jio_login(update, context, mobile, loop, chat_id):
             context.user_data.pop('jio_otp', None)
             return
 
-        # OTP received – delete timer message
         timer_id = context.user_data.pop('gemini_timer_msg_id', None)
         if timer_id:
             asyncio.run_coroutine_threadsafe(
@@ -875,7 +1281,6 @@ def perform_jio_login(update, context, mobile, loop, chat_id):
                 loop
             )
 
-        # ---------- 4. Validate OTP ----------
         try:
             validate_resp = session.post(
                 JIO_VALIDATE_OTP_URL,
@@ -895,11 +1300,9 @@ def perform_jio_login(update, context, mobile, loop, chat_id):
             notify("❌ *Invalid OTP!*\nPlease try again from start.\nNo credits were deducted.")
             return
 
-        # ---------- 5. Proceed to Gemini link ----------
         notify("🔍 *Finding Gemini Subscription Link...*")
         session.headers.update({"Referer": "https://www.jio.com/selfcare/googleai/"})
 
-        # 5a. activate
         activate_msg = ""
         try:
             act_resp = session.get(JIO_ACTIVATE_URL, timeout=30)
@@ -927,7 +1330,6 @@ def perform_jio_login(update, context, mobile, loop, chat_id):
             )
             return
 
-        # 5b. google-ai
         gemini_link = None
         ga_msg = ""
         max_retries = 3
@@ -963,9 +1365,10 @@ def perform_jio_login(update, context, mobile, loop, chat_id):
 
         if gemini_link:
             short_link = shorten_url(gemini_link)
-            user_id = update.effective_user.id
-            save_gemini_link(user_id, gemini_link, short_link)
+            mobile_number = context.user_data.get('jio_mobile', 'Unknown')
+            save_gemini_link(user_id, gemini_link, short_link, mobile_number)
             deduct_credit(user_id)
+            log_user_activity(user_id, "GEMINI_SUCCESS", f"Mobile: {mobile_number}")
             notify(
                 f"✅ *Gemini subscription link found*\n\n"
                 f"🔗 *Your Link:*\n`{short_link}`\n\n"
@@ -974,6 +1377,7 @@ def perform_jio_login(update, context, mobile, loop, chat_id):
             )
         else:
             reason = f"\n(Jio said: {ga_msg})" if ga_msg and ga_msg.upper() != "SUCCESS" else ""
+            log_user_activity(user_id, "GEMINI_FAILED", f"Mobile: {mobile}")
             notify(
                 "❌ *Gemini Subscription Link Not Found*\n\n"
                 "This number may have already claimed the offer or is not "
@@ -991,6 +1395,7 @@ def perform_jio_login(update, context, mobile, loop, chat_id):
         context.user_data.pop('gemini_timer_msg_id', None)
 
 # ------------------ SUPPORT SYSTEM ------------------
+@rate_limit_decorator
 async def support_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     message = update.message
@@ -1003,6 +1408,8 @@ async def support_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user[6] == 0:
         await send_join_prompt(update, context)
         return
+
+    log_user_activity(user_id, "SUPPORT_START", "Started support conversation")
 
     context.user_data['support_mode'] = True
     await message.reply_text(
@@ -1019,6 +1426,8 @@ async def support_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = get_user(user_id)
         name = user[7] if user else "Unknown"
         message = update.message.text
+
+        log_user_activity(user_id, "SUPPORT_MESSAGE", f"Message: {message[:100]}...")
 
         for admin_id in ADMIN_USER_IDS:
             try:
@@ -1050,6 +1459,8 @@ async def support_media_handler(update: Update, context: ContextTypes.DEFAULT_TY
     user = get_user(user_id)
     name = user[7] if user else "Unknown"
     message = update.message
+
+    log_user_activity(user_id, "SUPPORT_MEDIA", f"Media: {message.effective_attachment.__class__.__name__}")
 
     for admin_id in ADMIN_USER_IDS:
         try:
@@ -1100,6 +1511,7 @@ async def reply_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text=f"📩 *Reply from Support:*\n\n{reply_text}",
             parse_mode="Markdown"
         )
+        log_user_activity(user_id, "ADMIN_REPLY", f"To: {target_id}")
         await update.message.reply_text(f"✅ Reply sent to user {target_id}.")
     except Exception as e:
         await update.message.reply_text(f"❌ Failed to send reply: {e}")
@@ -1113,13 +1525,23 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     total_users = get_total_users()
     total_credits = get_total_credits()
     bonus = get_credits_per_referral()
+    spin_limit = get_spin_limit()
+    
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM users WHERE daily_login_date = ?", (datetime.now().strftime("%Y-%m-%d"),))
+    active_today = c.fetchone()[0]
+    conn.close()
+    
     text = (
         f"📊 *Bot Statistics*\n"
         f"Total Users: {total_users}\n"
+        f"Active Today: {active_today}\n"
         f"Total Credits in System: {total_credits}\n"
-        f"Credits per Referral: {bonus}"
+        f"Credits per Referral: {bonus}\n"
+        f"Spin Limit: Every {spin_limit} hour(s)"
     )
-    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_reply_keyboard)
+    await update.message.reply_text(text, parse_mode="Markdown")
 
 async def reset_credits(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -1132,6 +1554,7 @@ async def reset_credits(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     target_id = int(args[0])
     reset_user_credits(target_id)
+    log_user_activity(user_id, "ADMIN_RESET_CREDITS", f"User: {target_id}")
     await update.message.reply_text(f"Credits for user {target_id} have been reset to 0.")
 
 async def list_all_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1166,11 +1589,6 @@ async def list_all_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
         caption=f"✅ Total Users: {len(rows)}"
     )
 
-    print("\n" + "="*70)
-    print("📋 USER LIST (with Names) - Printed in Console")
-    print("="*70)
-    print(content)
-
 async def remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id not in ADMIN_USER_IDS:
@@ -1186,6 +1604,7 @@ async def remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"User {target_id} not found.")
         return
     delete_user(target_id)
+    log_user_activity(user_id, "ADMIN_REMOVE_USER", f"Removed: {target_id}")
     await update.message.reply_text(f"User {target_id} has been removed from the system.")
 
 async def add_credits_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1215,6 +1634,7 @@ async def add_credits_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     add_credits(target_id, amount)
     new_credits = user[2] + amount
+    log_user_activity(user_id, "ADMIN_ADD_CREDITS", f"User: {target_id}, Amount: {amount}")
     await update.message.reply_text(
         f"✅ Added {amount} credits to user {target_id}.\n"
         f"New balance: {new_credits} credits."
@@ -1245,6 +1665,7 @@ async def add_all_credits_command(update: Update, context: ContextTypes.DEFAULT_
         return
 
     add_all_credits(amount)
+    log_user_activity(user_id, "ADMIN_ADD_ALL_CREDITS", f"Amount: {amount}")
     await update.message.reply_text(
         f"✅ Added {amount} credits to ALL {total_users} users.\n"
         f"Total credits distributed: {amount * total_users}."
@@ -1270,92 +1691,256 @@ async def set_referral_credits(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     set_credits_per_referral(amount)
+    log_user_activity(user_id, "ADMIN_SET_REFERRAL", f"New bonus: {amount}")
     await update.message.reply_text(f"✅ Referral credits per referral set to **{amount}**.")
 
-# ------------------ GET DATABASE COMMAND (ADMIN ONLY) ------------------
-async def get_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def set_spin_limit_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    
     if user_id not in ADMIN_USER_IDS:
-        await update.message.reply_text("❌ You are not authorized to use this command.")
+        await update.message.reply_text("❌ Unauthorized.")
         return
-    
-    try:
-        if not os.path.exists(DB_NAME):
-            await update.message.reply_text("❌ Database file not found!")
-            return
-        
-        with open(DB_NAME, 'rb') as f:
-            await update.message.reply_document(
-                document=f,
-                filename="users.db",
-                caption=f"📊 Database backup\n📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n📁 Size: {os.path.getsize(DB_NAME)} bytes"
-            )
-        print(f"✅ Database sent to admin {user_id}")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error sending database: {str(e)[:100]}")
-        logging.error(f"get_db error: {e}")
 
-# ------------------ UPLOAD DATABASE COMMAND (ADMIN ONLY) ------------------
-async def upload_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    
-    if user_id not in ADMIN_USER_IDS:
-        await update.message.reply_text("❌ You are not authorized to use this command.")
-        return
-    
-    if not update.message.document:
+    args = context.args
+    if len(args) != 1:
         await update.message.reply_text(
-            "❌ Please send a file.\n"
-            "Usage: Send a .db file with caption /uploaddb"
+            "⏰ *Set Spin Time Limit*\n\n"
+            "Usage: `/set_spin_limit_time <hours>`\n\n"
+            "📌 Examples:\n"
+            "• `/set_spin_limit_time 2` → Users can spin once every 2 hours\n"
+            "• `/set_spin_limit_time 0` → No time limit (spin anytime)\n"
+            "• `/set_spin_limit_time 24` → Users can spin once per day\n\n"
+            f"💡 Current limit: Every {get_spin_limit()} hour(s)",
+            parse_mode="Markdown"
         )
         return
-    
-    file_name = update.message.document.file_name
-    if not file_name.endswith('.db'):
-        await update.message.reply_text(
-            "❌ Please send a valid .db file."
-        )
-        return
-    
+
     try:
-        file = await update.message.document.get_file()
-        temp_path = f"/tmp/{file_name}"
-        await file.download_to_drive(temp_path)
-        
-        # Validate SQLite database
+        hours = float(args[0])
+        if hours < 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Please provide a valid number of hours (0 or more).\n"
+            "Example: `/set_spin_limit_time 2`",
+            parse_mode="Markdown"
+        )
+        return
+
+    set_spin_limit(hours)
+    log_user_activity(user_id, "ADMIN_SET_SPIN_LIMIT", f"New limit: {hours} hours")
+    
+    if hours == 0:
+        await update.message.reply_text(
+            f"✅ *Spin time limit removed!*\n\n"
+            f"⏰ Users can spin anytime without any time restriction.\n"
+            f"🎰 Spin is completely FREE!",
+            parse_mode="Markdown"
+        )
+    else:
+        await update.message.reply_text(
+            f"✅ *Spin time limit set!*\n\n"
+            f"⏰ Users can spin once every **{hours}** hour(s).\n"
+            f"🎰 Spin is completely FREE!\n\n"
+            f"💡 Example: If set to 2 hours, users must wait 2 hours between spins.",
+            parse_mode="Markdown"
+        )
+
+async def spin_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in ADMIN_USER_IDS:
+        await update.message.reply_text("❌ Unauthorized.")
+        return
+
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    
+    c.execute("SELECT COUNT(*) FROM spin_history")
+    total_spins = c.fetchone()[0] or 0
+    
+    c.execute("SELECT SUM(prize) FROM spin_history")
+    total_prizes = c.fetchone()[0] or 0
+    
+    c.execute("SELECT COUNT(DISTINCT user_id) FROM spin_history")
+    unique_users = c.fetchone()[0] or 0
+    
+    c.execute("SELECT user_id, SUM(prize) as total FROM spin_history GROUP BY user_id ORDER BY total DESC LIMIT 1")
+    lucky_user = c.fetchone()
+    
+    avg_prize = total_prizes / total_spins if total_spins > 0 else 0
+    spin_limit = get_spin_limit()
+    
+    text = (
+        f"🎰 *Spin Wheel Statistics*\n\n"
+        f"📊 Total Spins: {total_spins}\n"
+        f"💰 Total Prizes Given: {total_prizes} credits\n"
+        f"👥 Unique Users: {unique_users}\n"
+        f"📈 Average Prize: {avg_prize:.2f} credits\n"
+        f"⏰ Spin Limit: {spin_limit} hour(s)\n"
+        f"💵 Cost: FREE\n"
+    )
+    
+    if lucky_user:
+        text += f"\n🏆 *Most Lucky User*\nUser ID: `{lucky_user[0]}`\nTotal Won: {lucky_user[1]} credits"
+    
+    conn.close()
+    
+    await update.message.reply_text(
+        text,
+        parse_mode="Markdown"
+    )
+
+async def user_activity(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in ADMIN_USER_IDS:
+        await update.message.reply_text("❌ Unauthorized.")
+        return
+
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "Usage: `/user_activity <user_id>`\n\n"
+            "Example: `/user_activity 123456789`",
+            parse_mode="Markdown"
+        )
+        return
+
+    try:
+        target_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Please provide a valid user ID.")
+        return
+
+    user = get_user(target_id)
+    if not user:
+        await update.message.reply_text(f"❌ User {target_id} not found.")
+        return
+
+    activities = get_user_activity(target_id, limit=20)
+    
+    if not activities:
+        await update.message.reply_text(f"📭 No activity found for user {target_id}.")
+        return
+
+    name = user[7] or "Unknown"
+    text = f"📋 *User Activity Log*\n"
+    text += f"User: `{target_id}` ({name})\n"
+    text += f"Credits: {user[2]} | Referrals: {user[5]}\n"
+    text += "=" * 30 + "\n\n"
+
+    for action, details, timestamp in activities:
         try:
-            conn = sqlite3.connect(temp_path)
-            conn.execute("SELECT 1 FROM users LIMIT 1")
-            conn.close()
-        except Exception as e:
-            await update.message.reply_text(
-                f"❌ Invalid database file: {str(e)[:100]}"
-            )
-            os.remove(temp_path)
-            return
+            dt = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S")
+            time_str = dt.strftime("%d-%m-%Y %H:%M")
+        except:
+            time_str = timestamp[:16]
         
-        # Backup old database
-        if os.path.exists(DB_NAME):
-            backup_name = f"{DB_NAME}.backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            shutil.copy2(DB_NAME, backup_name)
-            await update.message.reply_text(f"✅ Old database backed up as: {backup_name}")
-        
-        shutil.move(temp_path, DB_NAME)
-        
-        await update.message.reply_text(
-            f"✅ Database updated successfully!\n"
-            f"📁 New database: {file_name}\n"
-            f"📅 Updated at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-            f"⚠️ Please restart the bot for changes to take effect."
-        )
-        print(f"✅ Database uploaded by admin {user_id}")
-        
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error uploading database: {str(e)[:100]}")
-        logging.error(f"upload_db error: {e}")
+        text += f"⏰ {time_str}\n"
+        text += f"📌 *{action}*\n"
+        if details:
+            text += f"📝 {details}\n"
+        text += "-" * 20 + "\n"
 
-# ------------------ BROADCAST COMMAND ------------------
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+async def all_activity(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in ADMIN_USER_IDS:
+        await update.message.reply_text("❌ Unauthorized.")
+        return
+
+    args = context.args
+    limit = 50
+    if args and args[0].isdigit():
+        limit = min(int(args[0]), 200)
+
+    activities = get_all_activity(limit)
+    
+    if not activities:
+        await update.message.reply_text("📭 No activity found.")
+        return
+
+    text = f"📊 *Recent User Activity (Last {len(activities)})*\n"
+    text += "=" * 40 + "\n\n"
+
+    for uid, action, details, timestamp in activities:
+        try:
+            dt = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S")
+            time_str = dt.strftime("%d-%m %H:%M")
+        except:
+            time_str = timestamp[:11]
+        
+        text += f"👤 `{uid}` | ⏰ {time_str}\n"
+        text += f"📌 {action}"
+        if details:
+            text += f" - {details[:50]}"
+        text += "\n" + "-" * 30 + "\n"
+
+    if len(text) > 4000:
+        file_obj = io.BytesIO(text.encode('utf-8'))
+        file_obj.name = "activity_log.txt"
+        await update.message.reply_document(
+            document=file_obj,
+            filename="activity_log.txt",
+            caption=f"📊 Activity Log ({len(activities)} entries)"
+        )
+    else:
+        await update.message.reply_text(text, parse_mode="Markdown")
+
+async def activity_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in ADMIN_USER_IDS:
+        await update.message.reply_text("❌ Unauthorized.")
+        return
+
+    total, today_count, active_users, action_stats = get_activity_stats()
+
+    text = f"📊 *Activity Statistics*\n"
+    text += "=" * 30 + "\n\n"
+    text += f"📝 Total Activities: {total}\n"
+    text += f"📅 Today's Activities: {today_count}\n\n"
+
+    if active_users:
+        text += "👥 *Most Active Users Today*\n"
+        for uid, count in active_users[:5]:
+            user = get_user(uid)
+            name = user[7] if user else "Unknown"
+            text += f"• `{uid}` ({name}) - {count} actions\n"
+        text += "\n"
+
+    if action_stats:
+        text += "📌 *Action Breakdown Today*\n"
+        for action, count in action_stats[:10]:
+            text += f"• {action}: {count}\n"
+
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+async def clear_activity(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in ADMIN_USER_IDS:
+        await update.message.reply_text("❌ Unauthorized.")
+        return
+
+    args = context.args
+    days = 30
+    
+    if args and args[0].isdigit():
+        days = int(args[0])
+
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+    c.execute("DELETE FROM user_activity WHERE timestamp < ?", (cutoff,))
+    deleted = c.rowcount
+    conn.commit()
+    conn.close()
+
+    log_user_activity(user_id, "ADMIN_CLEAR_ACTIVITY", f"Deleted {deleted} records older than {days} days")
+
+    await update.message.reply_text(
+        f"✅ Deleted {deleted} activity records older than {days} days.\n"
+        f"📅 Keeping logs from {cutoff} onwards."
+    )
+
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id not in ADMIN_USER_IDS:
@@ -1383,6 +1968,8 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sent = 0
     failed = 0
 
+    log_user_activity(user_id, "ADMIN_BROADCAST", f"Message: {message_text[:100]}...")
+
     for (uid,) in rows:
         try:
             await context.bot.send_message(
@@ -1403,12 +1990,12 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Total users: {total}"
     )
 
-# ------------------ MAIN TEXT HANDLER ------------------
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
+    user_id = update.effective_user.id
 
     if context.user_data.get('gemini_step') in ['awaiting_mobile', 'awaiting_otp']:
-        if text in ["🔵 Gemini", "🔴 Profile", "🟢 Refer", "🟡 Support", "📜 History", "🏆 Leaderboard"]:
+        if text in ["🔵 Gemini", "🔴 Profile", "🟢 Refer", "🟡 Support", "📜 History", "🏆 Leaderboard", "🎰 Spin Wheel"]:
             context.user_data['gemini_cancelled'] = True
             context.user_data.pop('gemini_step', None)
             context.user_data.pop('jio_otp', None)
@@ -1445,13 +2032,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await history(update, context)
     elif text == "🏆 Leaderboard":
         await leaderboard(update, context)
+    elif text == "🎰 Spin Wheel":
+        await spin_wheel_handler(update, context)
     else:
         await update.message.reply_text(
-            "कृपया नीचे दिए गए बटनों का उपयोग करें।",
+            "Please use the buttons below.",
             reply_markup=main_reply_keyboard
         )
 
-# ------------------ SETUP COMMANDS ------------------
 async def setup_commands(app):
     default_commands = [
         BotCommand("start", "🚀 Start the bot"),
@@ -1469,8 +2057,12 @@ async def setup_commands(app):
         BotCommand("reply", "💬 Reply to a user's support message"),
         BotCommand("broadcast", "📢 Send a message to all users"),
         BotCommand("set_referral_credits", "⚙️ Change referral bonus amount"),
-        BotCommand("getdb", "📥 Download database file"),
-        BotCommand("uploaddb", "📤 Upload database file (send .db file)"),
+        BotCommand("set_spin_limit_time", "⏰ Set spin time limit"),
+        BotCommand("spin_stats", "🎰 View spin statistics"),
+        BotCommand("user_activity", "👤 View user activity log"),
+        BotCommand("all_activity", "📊 View all recent activity"),
+        BotCommand("activity_stats", "📈 View activity statistics"),
+        BotCommand("clear_activity", "🗑️ Clear old activity logs"),
     ]
     await app.bot.set_my_commands(default_commands, scope=BotCommandScopeDefault())
     for admin_id in ADMIN_USER_IDS:
@@ -1481,18 +2073,16 @@ async def post_init(app):
     await setup_commands(app)
     await check_and_broadcast_update(app)
 
-# ------------------ MAIN ------------------
 def main():
     print("Script is created by Rahul Mahipal")
     
     init_db()
     
-    # ✅ FIX: Timeouts set to prevent ReadTimeout errors
     app = (
         Application.builder()
         .token(BOT_TOKEN)
-        .connect_timeout(20.0)   # Connection timeout
-        .read_timeout(20.0)      # Read timeout
+        .connect_timeout(20.0)
+        .read_timeout(20.0)
         .build()
     )
 
@@ -1507,11 +2097,16 @@ def main():
     app.add_handler(CommandHandler("reply", reply_user))
     app.add_handler(CommandHandler("broadcast", broadcast))
     app.add_handler(CommandHandler("set_referral_credits", set_referral_credits))
-    app.add_handler(CommandHandler("getdb", get_db))
-    app.add_handler(CommandHandler("uploaddb", upload_db))
+    app.add_handler(CommandHandler("set_spin_limit_time", set_spin_limit_time))
+    app.add_handler(CommandHandler("spin_stats", spin_stats_command))
+    app.add_handler(CommandHandler("user_activity", user_activity))
+    app.add_handler(CommandHandler("all_activity", all_activity))
+    app.add_handler(CommandHandler("activity_stats", activity_stats))
+    app.add_handler(CommandHandler("clear_activity", clear_activity))
 
     app.add_handler(CallbackQueryHandler(check_join_callback, pattern="^check_join$"))
     app.add_handler(CallbackQueryHandler(refer_back_callback, pattern="^refer_back$"))
+    app.add_handler(CallbackQueryHandler(spin_callback, pattern="^spin_"))
 
     app.add_handler(
         MessageHandler(
@@ -1519,12 +2114,11 @@ def main():
             support_media_handler
         )
     )
-
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     app.post_init = post_init
 
-    print("✅ Bot running with all updates (auto-delete, referral config, history, auto-broadcast).")
+    print("✅ Bot running with all updates (Rate Limiting, FREE Spin Wheel, Activity Logs).")
     app.run_polling()
 
 if __name__ == "__main__":
